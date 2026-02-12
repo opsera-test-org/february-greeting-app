@@ -1,0 +1,82 @@
+# Opsera Code-to-Cloud Configuration
+# Generated: 2026-02-12
+# Version: v0.930
+
+application:
+  name: february-greeting-app
+  tenant: opsera
+  type: web-application
+  framework: vite-react-typescript
+
+cloud:
+  provider: aws
+  region: us-west-2
+  region_short: usw2
+
+clusters:
+  hub:
+    name: argocd-usw2
+    argocd_server: argocd-usw2.agent.opsera.dev
+  spoke:
+    name: opsera-usw2-np
+    domain: agent.opsera.dev
+
+environments:
+  dev:
+    enabled: true
+    branch: main
+    namespace: opsera-february-greeting-app-dev
+    deployment_strategy: rolling
+    replicas: 2
+    url: https://february-greeting-app-dev.agent.opsera.dev
+
+integrations:
+  security:
+    gitleaks:
+      enabled: true
+      mode: warn
+    grype:
+      enabled: true
+      mode: warn
+      severity_cutoff: high
+
+  code_quality:
+    sonarqube:
+      enabled: false
+
+  notifications:
+    slack:
+      enabled: false
+    jira:
+      enabled: false
+
+  monitoring:
+    prometheus:
+      enabled: false
+    newrelic:
+      enabled: false
+    datadog:
+      enabled: false
+
+pipeline:
+  version: v2.0
+  stages:
+    - security-scan
+    - build-image
+    - grype-scan
+    - push-to-ecr
+    - refresh-ecr-secret
+    - update-manifests
+    - argocd-refresh
+    - argocd-sync
+    - verify-deployment
+    - deployment-landscape
+
+ecr:
+  repository: opsera/february-greeting-app
+  image_tag_mutability: IMMUTABLE
+
+metadata:
+  created_at: 2026-02-12T00:00:00Z
+  created_by: opsera-c2c-enterprise
+  version: v0.930

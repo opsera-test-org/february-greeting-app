@@ -1,0 +1,409 @@
+name: "2️⃣ CI/CD Pipeline - Dev"
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '.opsera-**/**'
+      - '.github/workflows/1-bootstrap-*.yaml'
+      - '**/*.md'
+      - 'deployment-landscape-*.yaml'
+
+  workflow_dispatch:
+    inputs:
+      skip_tests:
+        description: 'Skip tests'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+env:
+  TENANT: opsera
+  APP_NAME: february-greeting-app
+  ENV: dev
+  AWS_REGION: us-west-2
+  HUB_CLUSTER: argocd-usw2
+  SPOKE_CLUSTER: opsera-usw2-np
+  ARGOCD_SERVER: argocd-usw2.agent.opsera.dev
+
+permissions:
+  contents: write
+  id-token: write
+  security-events: write
+
+concurrency:
+  group: ci-${{ github.repository }}-dev-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  security-scan:
+    name: "🔒 Security Scan (Gitleaks)"
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ vars.GITLEAKS_MODE == 'warn' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Display Scan Mode
+        if: always()
+        run: |
+          if [ "${{ vars.GITLEAKS_MODE }}" = "warn" ]; then
+            echo "⚠️  WARN MODE: Secrets detected but workflow continues"
+          else
+            echo "🚫 BLOCK MODE: Workflow failed due to secrets"
+          fi
+
+  build-image:
+    name: "🏗️ Build Docker Image"
+    runs-on: ubuntu-latest
+    needs: [security-scan]
+    outputs:
+      image_tag: ${{ steps.set-tag.outputs.image_tag }}
+      image_name: ${{ steps.set-tag.outputs.image_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set Image Tag
+        id: set-tag
+        run: |
+          IMAGE_TAG="dev-${GITHUB_SHA:0:8}-$(date +%Y%m%d%H%M%S)"
+          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "image_name=${APP_NAME}:${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "✅ Image tag: $IMAGE_TAG"
+
+      - name: Build Docker Image (Local Only)
+        run: |
+          docker build -t ${APP_NAME}:${{ steps.set-tag.outputs.image_tag }} .
+          echo "✅ Image built successfully"
+
+      - name: Save Docker Image to Artifact
+        run: |
+          docker save ${APP_NAME}:${{ steps.set-tag.outputs.image_tag }} -o /tmp/image.tar
+          echo "✅ Image saved to artifact"
+
+      - name: Upload Docker Image Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: /tmp/image.tar
+          retention-days: 1
+
+  grype-scan:
+    name: "🔍 Grype Vulnerability Scan"
+    runs-on: ubuntu-latest
+    needs: [build-image]
+    continue-on-error: ${{ vars.GRYPE_MODE == 'warn' }}
+    steps:
+      - name: Download Docker Image Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+
+      - name: Load Docker Image
+        run: |
+          docker load -i image.tar
+          echo "✅ Image loaded from artifact"
+
+      - name: Run Grype Scan
+        uses: anchore/scan-action@v3
+        with:
+          image: ${{ needs.build-image.outputs.image_name }}
+          fail-build: ${{ vars.GRYPE_MODE != 'warn' }}
+          severity-cutoff: high
+          output-format: sarif
+
+      - name: Upload Grype Results to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif
+
+      - name: Display Scan Mode
+        if: always()
+        run: |
+          if [ "${{ vars.GRYPE_MODE }}" = "warn" ]; then
+            echo "⚠️  WARN MODE: Vulnerabilities found but workflow continues"
+          else
+            echo "🚫 BLOCK MODE: Workflow failed due to vulnerabilities"
+          fi
+
+  push-to-ecr:
+    name: "📤 Push to ECR"
+    runs-on: ubuntu-latest
+    needs: [build-image, grype-scan]
+    if: success() || needs.grype-scan.result == 'success'
+    outputs:
+      ecr_uri: ${{ steps.push.outputs.ecr_uri }}
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download Docker Image Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+
+      - name: Load Docker Image
+        run: |
+          docker load -i image.tar
+          echo "✅ Image loaded from artifact"
+
+      - name: Login to ECR
+        run: |
+          aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $(aws sts get-caller-identity --query Account --output text).dkr.ecr.$AWS_REGION.amazonaws.com
+
+      - name: Push to ECR
+        id: push
+        run: |
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          ECR_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${TENANT}/${APP_NAME}"
+
+          docker tag ${APP_NAME}:${{ needs.build-image.outputs.image_tag }} ${ECR_URI}:${{ needs.build-image.outputs.image_tag }}
+          docker push ${ECR_URI}:${{ needs.build-image.outputs.image_tag }}
+
+          echo "ecr_uri=${ECR_URI}" >> $GITHUB_OUTPUT
+          echo "✅ Image pushed to ECR: ${ECR_URI}:${{ needs.build-image.outputs.image_tag }}"
+
+  refresh-ecr-secret:
+    name: "🔐 Refresh ECR Secret (SPOKE)"
+    runs-on: ubuntu-latest
+    needs: [push-to-ecr]
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Kubeconfig (Spoke)
+        run: |
+          aws eks update-kubeconfig --name $SPOKE_CLUSTER --region $AWS_REGION --alias spoke
+          kubectl config use-context spoke
+
+      - name: Refresh ECR Pull Secret (RULE 197)
+        run: |
+          NS="${TENANT}-${APP_NAME}-${ENV}"
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+          # Store ECR password in variable (not using stdin)
+          ECR_PASS=$(aws ecr get-login-password --region ${AWS_REGION})
+
+          # Use --docker-password with variable
+          kubectl --context spoke create secret docker-registry ecr-pull-secret \
+            --docker-server="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com" \
+            --docker-username=AWS \
+            --docker-password="$ECR_PASS" \
+            --namespace="${NS}" \
+            --dry-run=client -o yaml | kubectl --context spoke apply -f -
+
+          echo "✅ ECR secret refreshed (valid for 12 hours)"
+
+  update-manifests:
+    name: "📝 Update Manifests"
+    runs-on: ubuntu-latest
+    needs: [push-to-ecr, build-image]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Update Kustomize Overlay (RULE 196)
+        run: |
+          # Configure git
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Pull FIRST before making any changes
+          git pull --rebase origin ${{ github.ref_name }}
+          echo "✅ Pulled latest changes"
+
+          # Now safe to modify files
+          KUSTOMIZATION=".opsera-${APP_NAME}/k8s/overlays/${ENV}/kustomization.yaml"
+          IMAGE_TAG="${{ needs.build-image.outputs.image_tag }}"
+          ECR_URI="${{ needs.push-to-ecr.outputs.ecr_uri }}"
+
+          # Update kustomization.yaml with real ECR URI and tag
+          sed -i "s|newName:.*|newName: ${ECR_URI}|g" "$KUSTOMIZATION"
+          sed -i "s|newTag:.*|newTag: ${IMAGE_TAG}|g" "$KUSTOMIZATION"
+
+          echo "✅ Updated manifest with image: ${ECR_URI}:${IMAGE_TAG}"
+
+          # Stage, commit, push
+          git add "$KUSTOMIZATION"
+          git commit -m "chore(deploy): update dev image to ${IMAGE_TAG} [skip ci]"
+          git push origin ${{ github.ref_name }}
+
+  argocd-refresh:
+    name: "🔄 ArgoCD Hard Refresh (HUB)"
+    runs-on: ubuntu-latest
+    needs: [update-manifests]
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Kubeconfig (Hub)
+        run: |
+          aws eks update-kubeconfig --name $HUB_CLUSTER --region $AWS_REGION --alias hub
+          kubectl config use-context hub
+
+      - name: Trigger ArgoCD Refresh
+        run: |
+          APP_NAME_ARGOCD="${TENANT}-${APP_NAME}-${ENV}"
+
+          # Hard refresh ArgoCD application
+          kubectl --context hub patch application $APP_NAME_ARGOCD -n argocd \
+            --type merge -p '{"spec":{"source":{"repoURL":"https://github.com/${{ github.repository }}.git"}}}'
+
+          echo "✅ ArgoCD application refreshed: $APP_NAME_ARGOCD"
+
+  argocd-sync:
+    name: "⚡ Sync ArgoCD (HUB)"
+    runs-on: ubuntu-latest
+    needs: [argocd-refresh]
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Kubeconfig (Hub)
+        run: |
+          aws eks update-kubeconfig --name $HUB_CLUSTER --region $AWS_REGION --alias hub
+          kubectl config use-context hub
+
+      - name: Sync ArgoCD Application
+        run: |
+          APP_NAME_ARGOCD="${TENANT}-${APP_NAME}-${ENV}"
+
+          # Trigger sync
+          kubectl --context hub patch application $APP_NAME_ARGOCD -n argocd \
+            --type json -p='[{"op":"replace","path":"/operation","value":{"initiatedBy":{"username":"github-actions"},"sync":{"revision":"HEAD"}}}]'
+
+          echo "✅ ArgoCD sync triggered: $APP_NAME_ARGOCD"
+
+          # Wait for sync to complete
+          echo "Waiting for sync to complete (up to 5 minutes)..."
+          for i in {1..60}; do
+            SYNC_STATUS=$(kubectl --context hub get application $APP_NAME_ARGOCD -n argocd -o jsonpath='{.status.sync.status}')
+            HEALTH_STATUS=$(kubectl --context hub get application $APP_NAME_ARGOCD -n argocd -o jsonpath='{.status.health.status}')
+
+            echo "Sync: $SYNC_STATUS | Health: $HEALTH_STATUS"
+
+            if [ "$SYNC_STATUS" = "Synced" ] && [ "$HEALTH_STATUS" = "Healthy" ]; then
+              echo "✅ Application synced and healthy"
+              break
+            fi
+
+            if [ $i -eq 60 ]; then
+              echo "⚠️  Sync timeout - check ArgoCD UI"
+              exit 1
+            fi
+
+            sleep 5
+          done
+
+  verify-deployment:
+    name: "✅ Verify Deployment (SPOKE)"
+    runs-on: ubuntu-latest
+    needs: [argocd-sync, build-image]
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Kubeconfig (Spoke)
+        run: |
+          aws eks update-kubeconfig --name $SPOKE_CLUSTER --region $AWS_REGION --alias spoke
+          kubectl config use-context spoke
+
+      - name: Verify Pods Running
+        run: |
+          NS="${TENANT}-${APP_NAME}-${ENV}"
+
+          echo "Waiting for pods to be ready (up to 3 minutes)..."
+          kubectl --context spoke wait --for=condition=ready pod \
+            -l app=${APP_NAME} \
+            -n $NS \
+            --timeout=180s || {
+              echo "❌ Pods not ready, showing status:"
+              kubectl --context spoke get pods -n $NS
+              kubectl --context spoke describe pods -n $NS
+              exit 1
+            }
+
+          echo "✅ All pods running"
+          kubectl --context spoke get pods -n $NS
+
+      - name: Verify Service
+        run: |
+          NS="${TENANT}-${APP_NAME}-${ENV}"
+          kubectl --context spoke get svc ${APP_NAME} -n $NS
+          echo "✅ Service verified"
+
+      - name: Health Check (RULE 168)
+        run: |
+          NS="${TENANT}-${APP_NAME}-${ENV}"
+          POD=$(kubectl --context spoke get pod -n $NS -l app=${APP_NAME} -o jsonpath='{.items[0].metadata.name}')
+
+          # Use port-forward for health check
+          kubectl --context spoke port-forward -n $NS $POD 8081:8080 &
+          PF_PID=$!
+          sleep 3
+
+          # Check health endpoint
+          if wget -qO- http://localhost:8081/ > /dev/null 2>&1; then
+            echo "✅ Health check passed"
+            kill $PF_PID
+          else
+            echo "❌ Health check failed"
+            kill $PF_PID
+            exit 1
+          fi
+
+  trigger-landscape:
+    name: "📊 Deployment Landscape"
+    runs-on: ubuntu-latest
+    needs: [verify-deployment, build-image]
+    if: success()
+    steps:
+      - name: Trigger Deployment Landscape
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GH_PAT }}
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'deployment-landscape-february-greeting-app.yaml',
+              ref: '${{ github.ref_name }}',
+              inputs: {
+                environment: 'dev',
+                image_tag: '${{ needs.build-image.outputs.image_tag }}',
+                deployment_status: 'success',
+                timestamp: '${{ github.event.head_commit.timestamp }}'
+              }
+            })
+            console.log('✅ Landscape workflow triggered')
