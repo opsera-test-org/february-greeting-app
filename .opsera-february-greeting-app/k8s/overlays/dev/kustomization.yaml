@@ -8,8 +8,8 @@ resources:
 
 images:
   - name: all-is-well
-    newName: PLACEHOLDER_ECR_URI
-    newTag: latest
+    newName: 792373136340.dkr.ecr.us-west-2.amazonaws.com/opsera/february-greeting-app
+    newTag: dev-1fa5b089-20260212080619
 
 patches:
   - target:
