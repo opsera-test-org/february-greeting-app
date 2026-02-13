@@ -9,7 +9,7 @@ resources:
 images:
   - name: all-is-well
     newName: 792373136340.dkr.ecr.us-west-2.amazonaws.com/opsera/february-greeting-app
-    newTag: dev-1fa5b089-20260212080619
+    newTag: dev-52e9d0f9-20260213091834
 
 patches:
   - target:
